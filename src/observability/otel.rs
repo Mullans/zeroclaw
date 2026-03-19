@@ -3,6 +3,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::WithHttpConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
@@ -37,16 +38,30 @@ impl OtelObserver {
     ///
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
-    pub fn new(endpoint: Option<&str>, service_name: Option<&str>) -> Result<Self, String> {
+    pub fn new(endpoint: Option<&str>, service_name: Option<&str>, header_string: Option<&str>) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
         let service_name = service_name.unwrap_or("zeroclaw");
+        let headers: std::collections::HashMap<String, String> = header_string
+            .unwrap_or("")
+            .split(',')
+            .filter_map(|part| {
+                let (k, v) = part.split_once('=')?;
+                Some((k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+
+        eprintln!("[ATLAS DEBUG] OTEL headers count: {}", headers.len());
+        for (k, v) in &headers {
+            eprintln!("[ATLAS DEBUG] Header: {} = {}...", k, &v[..v.len().min(20)]);
+        }
 
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_endpoint(&traces_endpoint)
+            .with_headers(headers.clone())
             .build()
             .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
 
@@ -427,6 +442,9 @@ impl Observer for OtelObserver {
                 self.hand_runs.add(1, &attrs);
                 self.hand_duration
                     .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
+            },
+            _ => {
+                // Cache events - no-op for OTEL tracing
             }
         }
     }

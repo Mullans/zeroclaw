@@ -4,6 +4,15 @@
 
 <h1 align="center">ZeroClaw 🦀</h1>
 
+<h2 align="center">Useful Commands</h2>
+
+```
+  systemctl restart zeroclaw    # restart after config changes
+  systemctl stop zeroclaw       # stop
+  journalctl -u zeroclaw -f     # live logs
+  journalctl -u zeroclaw --since "5 min ago"  # recent logs
+```
+
 <p align="center">
   <strong>Zero overhead. Zero compromise. 100% Rust. 100% Agnostic.</strong><br>
   ⚡️ <strong>Runs on $10 hardware with <5MB RAM: That's 99% less memory than OpenClaw and 98% cheaper than a Mac mini!</strong>

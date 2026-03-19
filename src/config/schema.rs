@@ -3430,6 +3430,10 @@ pub struct ObservabilityConfig {
     #[serde(default)]
     pub otel_service_name: Option<String>,
 
+    /// Comma-separated key=value headers for OTLP exporter (e.g. "Authorization=Basic abc123")
+    #[serde(default)]
+    pub otel_headers: Option<String>,
+
     /// Runtime trace storage mode: "none" | "rolling" | "full".
     /// Controls whether model replies and tool-call diagnostics are persisted.
     #[serde(default = "default_runtime_trace_mode")]
@@ -3450,6 +3454,7 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            otel_headers: None,
             runtime_trace_mode: default_runtime_trace_mode(),
             runtime_trace_path: default_runtime_trace_path(),
             runtime_trace_max_entries: default_runtime_trace_max_entries(),
