@@ -1,3 +1,4 @@
+use crate::auth::AuthService;
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -11,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
-    timeout_secs: u64,
+    auth: Option<AuthService>,
+    auth_profile_override: Option<String>,
 }
 
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
@@ -154,16 +156,35 @@ impl OpenRouterProvider {
     pub fn new(credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
         Self {
             credential: credential.map(ToString::to_string),
-            timeout_secs: timeout_secs
-                .filter(|secs| *secs > 0)
-                .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
+            auth: None,
+            auth_profile_override: None,
         }
     }
 
-    /// Override the HTTP request timeout for LLM API calls.
-    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
-        self.timeout_secs = secs;
-        self
+    pub fn new_with_auth(
+        credential: Option<&str>,
+        auth: AuthService,
+        auth_profile_override: Option<String>,
+    ) -> Self {
+        Self {
+            credential: credential.map(ToString::to_string),
+            auth: Some(auth),
+            auth_profile_override,
+        }
+    }
+
+    async fn resolve_credential(&self) -> anyhow::Result<Option<String>> {
+        if let Some(credential) = self.credential.clone() {
+            return Ok(Some(credential));
+        }
+
+        if let Some(auth) = &self.auth {
+            return auth
+                .get_provider_bearer_token("openrouter", self.auth_profile_override.as_deref())
+                .await;
+        }
+
+        Ok(None)
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -363,7 +384,7 @@ impl Provider for OpenRouterProvider {
     async fn warmup(&self) -> anyhow::Result<()> {
         // Hit a lightweight endpoint to establish TLS + HTTP/2 connection pool.
         // This prevents the first real chat request from timing out on cold start.
-        if let Some(credential) = self.credential.as_ref() {
+        if let Some(credential) = self.resolve_credential().await? {
             self.http_client()
                 .get("https://openrouter.ai/api/v1/auth/key")
                 .header("Authorization", format!("Bearer {credential}"))
@@ -381,8 +402,10 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+        let credential = self
+            .resolve_credential()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard`, run `zeroclaw auth api set --provider openrouter`, or set OPENROUTER_API_KEY env var."))?;
 
         let mut messages = Vec::new();
 
@@ -436,8 +459,10 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."))?;
+        let credential = self
+            .resolve_credential()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("OpenRouter API key not set. Run `zeroclaw onboard`, run `zeroclaw auth api set --provider openrouter`, or set OPENROUTER_API_KEY env var."))?;
 
         let api_messages: Vec<Message> = messages
             .iter()
@@ -485,9 +510,9 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
+        let credential = self.resolve_credential().await?.ok_or_else(|| {
             anyhow::anyhow!(
-            "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
+            "OpenRouter API key not set. Run `zeroclaw onboard`, run `zeroclaw auth api set --provider openrouter`, or set OPENROUTER_API_KEY env var."
         )
         })?;
 
@@ -544,9 +569,9 @@ impl Provider for OpenRouterProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
+        let credential = self.resolve_credential().await?.ok_or_else(|| {
             anyhow::anyhow!(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var."
+                "OpenRouter API key not set. Run `zeroclaw onboard`, run `zeroclaw auth api set --provider openrouter`, or set OPENROUTER_API_KEY env var."
             )
         })?;
 
@@ -631,6 +656,7 @@ impl Provider for OpenRouterProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthService;
     use crate::providers::traits::{ChatMessage, Provider};
 
     #[test]
@@ -839,6 +865,47 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_prefers_explicit_key_over_auth_profile() {
+        let state_dir = tempfile::tempdir().expect("temp dir");
+        let auth = AuthService::new(state_dir.path(), true);
+        auth.store_provider_token("openrouter", "work", "auth-key", Default::default(), true)
+            .await
+            .expect("store auth profile");
+
+        let provider =
+            OpenRouterProvider::new_with_auth(Some("explicit-key"), auth, Some("work".to_string()));
+
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve credential");
+        assert_eq!(credential.as_deref(), Some("explicit-key"));
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_uses_auth_profile_when_no_explicit_key() {
+        let state_dir = tempfile::tempdir().expect("temp dir");
+        let auth = AuthService::new(state_dir.path(), true);
+        auth.store_provider_token(
+            "openrouter",
+            "work",
+            "auth-profile-key",
+            Default::default(),
+            true,
+        )
+        .await
+        .expect("store auth profile");
+
+        let provider = OpenRouterProvider::new_with_auth(None, auth, Some("work".to_string()));
+
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve credential");
+        assert_eq!(credential.as_deref(), Some("auth-profile-key"));
     }
 
     #[test]

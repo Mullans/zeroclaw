@@ -670,6 +670,40 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Manage API-key auth profiles (aliases for token-based auth flows)
+    Api {
+        #[command(subcommand)]
+        command: AuthApiCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthApiCommands {
+    /// Save API key for a provider profile and mark it active
+    Set {
+        /// Provider name (for example: openrouter, openai, anthropic)
+        #[arg(long)]
+        provider: String,
+        /// Profile name (default: default)
+        #[arg(long, default_value = "default")]
+        profile: String,
+        /// API key/token value (if omitted, read interactively)
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Set active API-key profile for a provider
+    Use {
+        /// Provider name
+        #[arg(long)]
+        provider: String,
+        /// Profile name or full profile id
+        #[arg(long)]
+        profile: String,
+    },
+    /// List all auth profiles
+    List,
+    /// Show auth status with active profile and expiry details
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2297,6 +2331,92 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 
             Ok(())
         }
+
+        AuthCommands::Api { command } => match command {
+            AuthApiCommands::Set {
+                provider,
+                profile,
+                key,
+            } => {
+                let provider = auth::normalize_provider(&provider)?;
+                let key = match key {
+                    Some(key) => key.trim().to_string(),
+                    None => read_auth_input("Paste API key")?,
+                };
+
+                if key.is_empty() {
+                    bail!("API key cannot be empty");
+                }
+
+                auth_service
+                    .store_provider_token(
+                        &provider,
+                        &profile,
+                        &key,
+                        std::collections::HashMap::new(),
+                        true,
+                    )
+                    .await?;
+                println!("Saved API profile {provider}:{profile}");
+                println!("Active profile for {provider}: {profile}");
+                Ok(())
+            }
+            AuthApiCommands::Use { provider, profile } => {
+                let provider = auth::normalize_provider(&provider)?;
+                auth_service.set_active_profile(&provider, &profile).await?;
+                println!("Active profile for {provider}: {profile}");
+                Ok(())
+            }
+            AuthApiCommands::List => {
+                let data = auth_service.load_profiles().await?;
+                if data.profiles.is_empty() {
+                    println!("No auth profiles configured.");
+                    return Ok(());
+                }
+
+                for (id, profile) in &data.profiles {
+                    let active = data
+                        .active_profiles
+                        .get(&profile.provider)
+                        .is_some_and(|active_id| active_id == id);
+                    let marker = if active { "*" } else { " " };
+                    println!("{marker} {id}");
+                }
+
+                Ok(())
+            }
+            AuthApiCommands::Status => {
+                let data = auth_service.load_profiles().await?;
+                if data.profiles.is_empty() {
+                    println!("No auth profiles configured.");
+                    return Ok(());
+                }
+
+                for (id, profile) in &data.profiles {
+                    let active = data
+                        .active_profiles
+                        .get(&profile.provider)
+                        .is_some_and(|active_id| active_id == id);
+                    let marker = if active { "*" } else { " " };
+                    println!(
+                        "{} {} kind={:?} account={} expires={}",
+                        marker,
+                        id,
+                        profile.kind,
+                        crate::security::redact(profile.account_id.as_deref().unwrap_or("unknown")),
+                        format_expiry(profile)
+                    );
+                }
+
+                println!();
+                println!("Active profiles:");
+                for (provider, profile_id) in &data.active_profiles {
+                    println!("  {provider}: {profile_id}");
+                }
+
+                Ok(())
+            }
+        },
     }
 }
 
@@ -2370,6 +2490,70 @@ mod tests {
                 Commands::Completions { .. } => {}
                 other => panic!("expected completions command, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn auth_api_set_parses() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "auth",
+            "api",
+            "set",
+            "--provider",
+            "openrouter",
+            "--profile",
+            "work",
+            "--key",
+            "sk-or-v1-test",
+        ])
+        .expect("auth api set should parse");
+
+        match cli.command {
+            Commands::Auth {
+                auth_command:
+                    AuthCommands::Api {
+                        command:
+                            AuthApiCommands::Set {
+                                provider,
+                                profile,
+                                key,
+                            },
+                    },
+            } => {
+                assert_eq!(provider, "openrouter");
+                assert_eq!(profile, "work");
+                assert_eq!(key.as_deref(), Some("sk-or-v1-test"));
+            }
+            other => panic!("expected auth api set command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_api_use_parses() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "auth",
+            "api",
+            "use",
+            "--provider",
+            "openrouter",
+            "--profile",
+            "work",
+        ])
+        .expect("auth api use should parse");
+
+        match cli.command {
+            Commands::Auth {
+                auth_command:
+                    AuthCommands::Api {
+                        command: AuthApiCommands::Use { provider, profile },
+                    },
+            } => {
+                assert_eq!(provider, "openrouter");
+                assert_eq!(profile, "work");
+            }
+            other => panic!("expected auth api use command, got {other:?}"),
         }
     }
 

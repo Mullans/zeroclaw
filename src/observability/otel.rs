@@ -38,7 +38,11 @@ impl OtelObserver {
     ///
     /// Uses HTTP/protobuf transport (port 4318 by default).
     /// Falls back to `http://localhost:4318` if no endpoint is provided.
-    pub fn new(endpoint: Option<&str>, service_name: Option<&str>, header_string: Option<&str>) -> Result<Self, String> {
+    pub fn new(
+        endpoint: Option<&str>,
+        service_name: Option<&str>,
+        header_string: Option<&str>,
+    ) -> Result<Self, String> {
         let base_endpoint = endpoint.unwrap_or("http://localhost:4318");
         let traces_endpoint = format!("{}/v1/traces", base_endpoint.trim_end_matches('/'));
         let metrics_endpoint = format!("{}/v1/metrics", base_endpoint.trim_end_matches('/'));
@@ -439,7 +443,7 @@ impl Observer for OtelObserver {
                 self.hand_runs.add(1, &attrs);
                 self.hand_duration
                     .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
-            },
+            }
             _ => {
                 // Cache events - no-op for OTEL tracing
             }
