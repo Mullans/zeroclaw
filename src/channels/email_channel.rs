@@ -58,6 +58,14 @@ pub struct EmailConfig {
     pub username: String,
     /// Email password for authentication
     pub password: String,
+    /// Optional IMAP username override (falls back to `username`)
+    pub imap_username: Option<String>,
+    /// Optional IMAP password override (falls back to `password`)
+    pub imap_password: Option<String>,
+    /// Optional SMTP username override (falls back to `username`)
+    pub smtp_username: Option<String>,
+    /// Optional SMTP password override (falls back to `password`)
+    pub smtp_password: Option<String>,
     /// From address for outgoing emails
     pub from_address: String,
     /// IDLE timeout in seconds before re-establishing connection (default: 1740 = 29 minutes)
@@ -111,6 +119,10 @@ impl Default for EmailConfig {
             smtp_tls: true,
             username: String::new(),
             password: String::new(),
+            imap_username: None,
+            imap_password: None,
+            smtp_username: None,
+            smtp_password: None,
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
@@ -235,8 +247,9 @@ impl EmailChannel {
         let client = async_imap::Client::new(stream);
 
         // Login
+        let (username, password) = self.resolve_imap_credentials();
         let session = client
-            .login(&self.config.username, &self.config.password)
+            .login(username, password)
             .await
             .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
 
@@ -479,7 +492,8 @@ impl EmailChannel {
     }
 
     fn create_smtp_transport(&self) -> Result<SmtpTransport> {
-        let creds = Credentials::new(self.config.username.clone(), self.config.password.clone());
+        let (username, password) = self.resolve_smtp_credentials();
+        let creds = Credentials::new(username.to_string(), password.to_string());
         let transport = if self.config.smtp_tls {
             SmtpTransport::relay(&self.config.smtp_host)?
                 .port(self.config.smtp_port)
@@ -492,6 +506,32 @@ impl EmailChannel {
                 .build()
         };
         Ok(transport)
+    }
+
+    fn resolve_imap_credentials(&self) -> (&str, &str) {
+        (
+            self.config
+                .imap_username
+                .as_deref()
+                .unwrap_or(self.config.username.as_str()),
+            self.config
+                .imap_password
+                .as_deref()
+                .unwrap_or(self.config.password.as_str()),
+        )
+    }
+
+    fn resolve_smtp_credentials(&self) -> (&str, &str) {
+        (
+            self.config
+                .smtp_username
+                .as_deref()
+                .unwrap_or(self.config.username.as_str()),
+            self.config
+                .smtp_password
+                .as_deref()
+                .unwrap_or(self.config.password.as_str()),
+        )
     }
 }
 
@@ -624,6 +664,10 @@ mod tests {
         assert!(config.smtp_tls);
         assert_eq!(config.username, "");
         assert_eq!(config.password, "");
+        assert_eq!(config.imap_username, None);
+        assert_eq!(config.imap_password, None);
+        assert_eq!(config.smtp_username, None);
+        assert_eq!(config.smtp_password, None);
         assert_eq!(config.from_address, "");
         assert_eq!(config.idle_timeout_secs, 1740);
         assert!(config.allowed_senders.is_empty());
@@ -640,6 +684,10 @@ mod tests {
             smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "pass123".to_string(),
+            imap_username: Some("imap-user@example.com".to_string()),
+            imap_password: Some("imap-pass123".to_string()),
+            smtp_username: Some("smtp-user@example.com".to_string()),
+            smtp_password: Some("smtp-pass123".to_string()),
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
@@ -662,6 +710,10 @@ mod tests {
             smtp_tls: true,
             username: "user@test.com".to_string(),
             password: "secret".to_string(),
+            imap_username: None,
+            imap_password: None,
+            smtp_username: None,
+            smtp_password: None,
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
@@ -896,6 +948,44 @@ mod tests {
         assert!(default_true());
     }
 
+    #[test]
+    fn resolve_imap_credentials_prefers_imap_specific_values() {
+        let channel = EmailChannel::new(EmailConfig {
+            username: "shared-user".to_string(),
+            password: "shared-pass".to_string(),
+            imap_username: Some("imap-user".to_string()),
+            imap_password: Some("imap-pass".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(channel.resolve_imap_credentials(), ("imap-user", "imap-pass"));
+    }
+
+    #[test]
+    fn resolve_smtp_credentials_prefers_smtp_specific_values() {
+        let channel = EmailChannel::new(EmailConfig {
+            username: "shared-user".to_string(),
+            password: "shared-pass".to_string(),
+            smtp_username: Some("smtp-user".to_string()),
+            smtp_password: Some("smtp-pass".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(channel.resolve_smtp_credentials(), ("smtp-user", "smtp-pass"));
+    }
+
+    #[test]
+    fn resolve_credentials_fall_back_to_shared_values() {
+        let channel = EmailChannel::new(EmailConfig {
+            username: "shared-user".to_string(),
+            password: "shared-pass".to_string(),
+            ..Default::default()
+        });
+
+        assert_eq!(channel.resolve_imap_credentials(), ("shared-user", "shared-pass"));
+        assert_eq!(channel.resolve_smtp_credentials(), ("shared-user", "shared-pass"));
+    }
+
     // EmailConfig serialization tests
 
     #[test]
@@ -909,6 +999,10 @@ mod tests {
             smtp_tls: true,
             username: "user@example.com".to_string(),
             password: "password123".to_string(),
+            imap_username: Some("imap-user@example.com".to_string()),
+            imap_password: Some("imap-password123".to_string()),
+            smtp_username: Some("smtp-user@example.com".to_string()),
+            smtp_password: Some("smtp-password123".to_string()),
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
@@ -922,6 +1016,8 @@ mod tests {
         assert_eq!(deserialized.smtp_port, config.smtp_port);
         assert_eq!(deserialized.allowed_senders, config.allowed_senders);
         assert_eq!(deserialized.default_subject, config.default_subject);
+        assert_eq!(deserialized.imap_username, config.imap_username);
+        assert_eq!(deserialized.smtp_username, config.smtp_username);
     }
 
     #[test]
@@ -940,6 +1036,10 @@ mod tests {
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
         assert_eq!(config.default_subject, "ZeroClaw Message"); // default
+        assert_eq!(config.imap_username, None);
+        assert_eq!(config.imap_password, None);
+        assert_eq!(config.smtp_username, None);
+        assert_eq!(config.smtp_password, None);
     }
 
     #[test]

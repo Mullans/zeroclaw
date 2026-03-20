@@ -283,10 +283,20 @@ smtp_port = 465
 smtp_tls = true
 username = "bot@example.com"
 password = "email-password"
+# Optional protocol-specific overrides (fallback to shared username/password)
+imap_username = "imap-bot@example.com"
+imap_password = "imap-password"
+smtp_username = "smtp-bot@example.com"
+smtp_password = "smtp-password"
 from_address = "bot@example.com"
 poll_interval_secs = 60
 allowed_senders = ["*"]
 ```
+
+Credential precedence:
+
+- IMAP uses `imap_username`/`imap_password` when set, else falls back to `username`/`password`.
+- SMTP uses `smtp_username`/`smtp_password` when set, else falls back to `username`/`password`.
 
 ### 4.10 IRC
 

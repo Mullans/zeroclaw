@@ -6808,6 +6808,16 @@ impl Config {
                     &mut em.password,
                     "config.channels_config.email.password",
                 )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut em.imap_password,
+                    "config.channels_config.email.imap_password",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut em.smtp_password,
+                    "config.channels_config.email.smtp_password",
+                )?;
             }
             if let Some(ref mut irc) = config.channels_config.irc {
                 decrypt_optional_secret(
@@ -8017,6 +8027,16 @@ impl Config {
                 &store,
                 &mut em.password,
                 "config.channels_config.email.password",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut em.imap_password,
+                "config.channels_config.email.imap_password",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut em.smtp_password,
+                "config.channels_config.email.smtp_password",
             )?;
         }
         if let Some(ref mut irc) = config_to_save.channels_config.irc {

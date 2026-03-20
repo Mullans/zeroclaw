@@ -934,6 +934,8 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     }
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
+        mask_optional_secret(&mut email.imap_password);
+        mask_optional_secret(&mut email.smtp_password);
     }
     masked
 }
@@ -1121,6 +1123,8 @@ fn restore_masked_sensitive_fields(
         current.channels_config.email.as_ref(),
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
+        restore_optional_secret(&mut incoming_ch.imap_password, &current_ch.imap_password);
+        restore_optional_secret(&mut incoming_ch.smtp_password, &current_ch.smtp_password);
     }
 }
 
@@ -1243,6 +1247,10 @@ mod tests {
             smtp_tls: true,
             username: "agent@example.com".to_string(),
             password: "email-password-secret".to_string(),
+            imap_username: Some("imap-agent@example.com".to_string()),
+            imap_password: Some("imap-password-secret".to_string()),
+            smtp_username: Some("smtp-agent@example.com".to_string()),
+            smtp_password: Some("smtp-password-secret".to_string()),
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
@@ -1335,6 +1343,22 @@ mod tests {
                 .map(|v| v.password.as_str()),
             Some(MASKED_SECRET)
         );
+        assert_eq!(
+            parsed
+                .channels_config
+                .email
+                .as_ref()
+                .and_then(|v| v.imap_password.as_deref()),
+            Some(MASKED_SECRET)
+        );
+        assert_eq!(
+            parsed
+                .channels_config
+                .email
+                .as_ref()
+                .and_then(|v| v.smtp_password.as_deref()),
+            Some(MASKED_SECRET)
+        );
     }
 
     #[test]
@@ -1377,6 +1401,10 @@ mod tests {
             smtp_tls: true,
             username: "agent@example.com".to_string(),
             password: "email-password-real".to_string(),
+            imap_username: Some("imap-agent@example.com".to_string()),
+            imap_password: Some("imap-password-real".to_string()),
+            smtp_username: Some("smtp-agent@example.com".to_string()),
+            smtp_password: Some("smtp-password-real".to_string()),
             from_address: "agent@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
@@ -1435,6 +1463,8 @@ mod tests {
         }
         if let Some(email) = incoming.channels_config.email.as_mut() {
             email.password = MASKED_SECRET.to_string();
+            email.imap_password = Some(MASKED_SECRET.to_string());
+            email.smtp_password = Some(MASKED_SECRET.to_string());
         }
         incoming.model_routes[1].api_key = Some("route-model-key-2-new".to_string());
         incoming.embedding_routes[1].api_key = Some("route-embed-key-2-new".to_string());
@@ -1528,6 +1558,22 @@ mod tests {
                 .as_ref()
                 .map(|v| v.password.as_str()),
             Some("email-password-real")
+        );
+        assert_eq!(
+            hydrated
+                .channels_config
+                .email
+                .as_ref()
+                .and_then(|v| v.imap_password.as_deref()),
+            Some("imap-password-real")
+        );
+        assert_eq!(
+            hydrated
+                .channels_config
+                .email
+                .as_ref()
+                .and_then(|v| v.smtp_password.as_deref()),
+            Some("smtp-password-real")
         );
     }
 
