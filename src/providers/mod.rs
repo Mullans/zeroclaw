@@ -1143,6 +1143,7 @@ fn create_provider_with_url_and_options(
                 key,
                 auth_service,
                 options.auth_profile_override.clone(),
+                options.provider_timeout_secs,
             )))
         }
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),

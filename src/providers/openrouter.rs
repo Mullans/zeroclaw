@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct OpenRouterProvider {
     credential: Option<String>,
+    timeout_secs: u64,
     auth: Option<AuthService>,
     auth_profile_override: Option<String>,
 }
@@ -154,8 +155,12 @@ struct NativeResponseMessage {
 
 impl OpenRouterProvider {
     pub fn new(credential: Option<&str>, timeout_secs: Option<u64>) -> Self {
+        let timeout_secs = timeout_secs
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS);
         Self {
             credential: credential.map(ToString::to_string),
+            timeout_secs,
             auth: None,
             auth_profile_override: None,
         }
@@ -165,12 +170,25 @@ impl OpenRouterProvider {
         credential: Option<&str>,
         auth: AuthService,
         auth_profile_override: Option<String>,
+        timeout_secs: Option<u64>,
     ) -> Self {
+        let timeout_secs = timeout_secs
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS);
         Self {
             credential: credential.map(ToString::to_string),
+            timeout_secs,
             auth: Some(auth),
             auth_profile_override,
         }
+    }
+
+    #[must_use]
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        if timeout_secs > 0 {
+            self.timeout_secs = timeout_secs;
+        }
+        self
     }
 
     async fn resolve_credential(&self) -> anyhow::Result<Option<String>> {
@@ -875,8 +893,12 @@ mod tests {
             .await
             .expect("store auth profile");
 
-        let provider =
-            OpenRouterProvider::new_with_auth(Some("explicit-key"), auth, Some("work".to_string()));
+        let provider = OpenRouterProvider::new_with_auth(
+            Some("explicit-key"),
+            auth,
+            Some("work".to_string()),
+            None,
+        );
 
         let credential = provider
             .resolve_credential()
@@ -899,7 +921,8 @@ mod tests {
         .await
         .expect("store auth profile");
 
-        let provider = OpenRouterProvider::new_with_auth(None, auth, Some("work".to_string()));
+        let provider =
+            OpenRouterProvider::new_with_auth(None, auth, Some("work".to_string()), None);
 
         let credential = provider
             .resolve_credential()
