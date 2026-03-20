@@ -52,11 +52,6 @@ impl OtelObserver {
             })
             .collect();
 
-        eprintln!("[ATLAS DEBUG] OTEL headers count: {}", headers.len());
-        for (k, v) in &headers {
-            eprintln!("[ATLAS DEBUG] Header: {} = {}...", k, &v[..v.len().min(20)]);
-        }
-
         // ── Trace exporter ──────────────────────────────────────
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
