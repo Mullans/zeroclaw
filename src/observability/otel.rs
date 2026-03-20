@@ -220,7 +220,9 @@ impl Observer for OtelObserver {
             }
             ObserverEvent::LlmRequest { .. }
             | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete => {}
+            | ObserverEvent::TurnComplete
+            | ObserverEvent::CacheHit { .. }
+            | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {
                 provider,
                 model,

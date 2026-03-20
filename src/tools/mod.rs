@@ -19,6 +19,7 @@ pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
+pub mod calculator;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -46,6 +47,7 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
@@ -74,6 +76,7 @@ pub mod screenshot;
 pub mod security_ops;
 pub mod shell;
 pub mod swarm;
+pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
@@ -85,6 +88,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
+pub use calculator::CalculatorTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -111,6 +115,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
 pub use mcp_client::McpRegistry;
@@ -137,6 +142,7 @@ pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
 pub use shell::ShellTool;
 pub use swarm::SwarmTool;
+pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -321,6 +327,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(CalculatorTool::new()),
     ];
 
     if matches!(
@@ -395,6 +402,15 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Text browser tool (headless text-based browser rendering)
+    if root_config.text_browser.enabled {
+        tool_arcs.push(Arc::new(TextBrowserTool::new(
+            security.clone(),
+            root_config.text_browser.preferred_browser.clone(),
+            root_config.text_browser.timeout_secs,
+        )));
+    }
+
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
@@ -420,6 +436,33 @@ pub fn all_tools_with_runtime(
             );
         } else {
             tool_arcs.push(Arc::new(NotionTool::new(notion_api_key, security.clone())));
+        }
+    }
+
+    // Jira integration (config-gated)
+    if root_config.jira.enabled {
+        let api_token = if root_config.jira.api_token.trim().is_empty() {
+            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
+        } else {
+            root_config.jira.api_token.trim().to_string()
+        };
+        if api_token.trim().is_empty() {
+            tracing::warn!(
+                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
+            );
+        } else if root_config.jira.base_url.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
+        } else if root_config.jira.email.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
+        } else {
+            tool_arcs.push(Arc::new(JiraTool::new(
+                root_config.jira.base_url.trim().to_string(),
+                root_config.jira.email.trim().to_string(),
+                api_token,
+                root_config.jira.allowed_actions.clone(),
+                security.clone(),
+                root_config.jira.timeout_secs,
+            )));
         }
     }
 
@@ -466,6 +509,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
             security.clone(),
             root_config.google_workspace.allowed_services.clone(),
+            root_config.google_workspace.allowed_operations.clone(),
             root_config.google_workspace.credentials_path.clone(),
             root_config.google_workspace.default_account.clone(),
             root_config.google_workspace.rate_limit_per_minute,
@@ -618,7 +662,8 @@ pub fn all_tools_with_runtime(
             provider_runtime_options.clone(),
         )
         .with_parent_tools(Arc::clone(&parent_tools))
-        .with_multimodal_config(root_config.multimodal.clone());
+        .with_multimodal_config(root_config.multimodal.clone())
+        .with_delegate_config(root_config.delegate.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };

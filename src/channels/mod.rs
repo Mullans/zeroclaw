@@ -288,9 +288,13 @@ const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 struct InterruptOnNewMessageConfig {
     telegram: bool,
     slack: bool,
+    discord: bool,
+    mattermost: bool,
+    matrix: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -298,6 +302,9 @@ impl InterruptOnNewMessageConfig {
         match channel {
             "telegram" => self.telegram,
             "slack" => self.slack,
+            "discord" => self.discord,
+            "mattermost" => self.mattermost,
+            "matrix" => self.matrix,
             _ => false,
         }
     }
@@ -389,10 +396,14 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic session isolation in forum groups
+    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
+    // channels) and thread_ts for per-topic isolation in forum groups.
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
-        None => format!("{}_{}", msg.channel, msg.sender),
+        Some(tid) => format!(
+            "{}_{}_{}_{}",
+            msg.channel, msg.reply_target, tid, msg.sender
+        ),
+        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
     }
 }
 
@@ -401,7 +412,25 @@ fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+    match &msg.interruption_scope_id {
+        Some(scope) => format!(
+            "{}_{}_{}_{}",
+            msg.channel, msg.reply_target, msg.sender, scope
+        ),
+        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+    }
+}
+
+/// Returns `true` when `content` is a `/stop` command (with optional `@botname` suffix).
+/// Not gated on channel type — all non-CLI channels support `/stop`.
+fn is_stop_command(content: &str) -> bool {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let cmd = trimmed.split_whitespace().next().unwrap_or("");
+    let base = cmd.split('@').next().unwrap_or(cmd);
+    base.eq_ignore_ascii_case("/stop")
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -542,6 +571,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "qq" => Some(
+            "When responding on QQ:\n\
+             - Use Markdown formatting\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
+             - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         _ => None,
     }
@@ -1439,6 +1477,11 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            if let Some(ref store) = ctx.session_store {
+                if let Err(e) = store.delete_session(&sender_key) {
+                    tracing::warn!("Failed to delete persisted session for {sender_key}: {e}");
+                }
+            }
             mark_sender_for_new_session(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
@@ -2749,12 +2792,52 @@ async fn run_message_dispatch_loop(
         String,
         InFlightSenderTaskState,
     >::new()));
-    #[cfg(target_has_atomic = "64")]
     let task_sequence = Arc::new(AtomicU64::new(1));
-    #[cfg(not(target_has_atomic = "64"))]
-    let task_sequence = Arc::new(AtomicU32::new(1));
 
     while let Some(msg) = rx.recv().await {
+        // Fast path: /stop cancels the in-flight task for this sender scope without
+        // spawning a worker or registering a new task. Handled here — before semaphore
+        // acquisition — so the target task is still in the store and is never replaced.
+        if msg.channel != "cli" && is_stop_command(&msg.content) {
+            let scope_key = interruption_scope_key(&msg);
+            let previous = {
+                let mut active = in_flight_by_sender.lock().await;
+                active.remove(&scope_key)
+            };
+            let reply = if let Some(state) = previous {
+                state.cancellation.cancel();
+                "Stop signal sent.".to_string()
+            } else {
+                "No in-flight task for this sender scope.".to_string()
+            };
+            let channel = ctx
+                .channels_by_name
+                .get(&msg.channel)
+                .or_else(|| {
+                    // Multi-room channels use "name:qualifier" format (e.g. "matrix:!roomId");
+                    // fall back to base channel name for routing.
+                    msg.channel
+                        .split_once(':')
+                        .and_then(|(base, _)| ctx.channels_by_name.get(base))
+                })
+                .cloned();
+            if let Some(channel) = channel {
+                let reply_target = msg.reply_target.clone();
+                let thread_ts = msg.thread_ts.clone();
+                tokio::spawn(async move {
+                    let _ = channel
+                        .send(&SendMessage::new(reply, &reply_target).in_thread(thread_ts))
+                        .await;
+                });
+            } else {
+                tracing::warn!(
+                    channel = %msg.channel,
+                    "stop command: no registered channel found for reply"
+                );
+            }
+            continue;
+        }
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -2773,7 +2856,12 @@ async fn run_message_dispatch_loop(
             let completion = Arc::new(InFlightTaskCompletion::new());
             let task_id = task_sequence.fetch_add(1, Ordering::Relaxed) as u64;
 
-            if interrupt_enabled {
+            // Register all non-CLI tasks in the in-flight store so /stop can reach them.
+            // This is a deliberate broadening from the previous behaviour where only
+            // interrupt_enabled (Telegram/Slack) channels registered tasks.
+            let register_in_flight = msg.channel != "cli";
+
+            if register_in_flight {
                 let previous = {
                     let mut active = in_flight.lock().await;
                     active.insert(
@@ -2786,20 +2874,22 @@ async fn run_message_dispatch_loop(
                     )
                 };
 
-                if let Some(previous) = previous {
-                    tracing::info!(
-                        channel = %msg.channel,
-                        sender = %msg.sender,
-                        "Interrupting previous in-flight request for sender"
-                    );
-                    previous.cancellation.cancel();
-                    previous.completion.wait().await;
+                if interrupt_enabled {
+                    if let Some(previous) = previous {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            "Interrupting previous in-flight request for sender"
+                        );
+                        previous.cancellation.cancel();
+                        previous.completion.wait().await;
+                    }
                 }
             }
 
             process_channel_message(worker_ctx, msg, cancellation_token).await;
 
-            if interrupt_enabled {
+            if register_in_flight {
                 let mut active = in_flight.lock().await;
                 if active
                     .get(&sender_scope_key)
@@ -2896,6 +2986,34 @@ pub fn build_system_prompt_with_mode(
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     autonomy_level: AutonomyLevel,
 ) -> String {
+    let autonomy_cfg = crate::config::AutonomyConfig {
+        level: autonomy_level,
+        ..Default::default()
+    };
+    build_system_prompt_with_mode_and_autonomy(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        Some(&autonomy_cfg),
+        native_tools,
+        skills_prompt_mode,
+    )
+}
+
+pub fn build_system_prompt_with_mode_and_autonomy(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    autonomy_config: Option<&crate::config::AutonomyConfig>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
 
@@ -2908,6 +3026,14 @@ pub fn build_system_prompt_with_mode(
          The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
          never reference them. If you catch yourself starting a sentence about what tool \
          you are about to use or just used, DELETE it and give the answer directly.\n\n",
+    );
+
+    // ── 0b. Tool Honesty ───────────────────────────────────────
+    prompt.push_str(
+        "## CRITICAL: Tool Honesty\n\n\
+         - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
+         - If a tool call fails, report the error — never make up data to fill the gap.\n\
+         - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
     );
 
     // ── 1. Tooling ──────────────────────────────────────────────
@@ -2961,16 +3087,28 @@ pub fn build_system_prompt_with_mode(
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
     prompt.push_str("- Do not exfiltrate private data.\n");
-    if autonomy_level != AutonomyLevel::Full {
+    if autonomy_config.map(|cfg| cfg.level) != Some(crate::security::AutonomyLevel::Full) {
         prompt.push_str(
             "- Do not run destructive commands without asking.\n\
              - Do not bypass oversight or approval mechanisms.\n",
         );
     }
     prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
-    if autonomy_level != AutonomyLevel::Full {
-        prompt.push_str("- When in doubt, ask before acting externally.\n");
-    }
+    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+        Some(crate::security::AutonomyLevel::Full) => {
+            "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
+             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+        }
+        Some(crate::security::AutonomyLevel::ReadOnly) => {
+            "- Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
+             - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n"
+        }
+        _ => {
+            "- When in doubt, ask before acting externally.\n\
+             - Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
+             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+        }
+    });
     prompt.push('\n');
 
     // ── 3. Skills (full or compact, based on config) ─────────────
@@ -3053,6 +3191,20 @@ pub fn build_system_prompt_with_mode(
     prompt.push_str("## Channel Capabilities\n\n");
     prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
     prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+        Some(crate::security::AutonomyLevel::Full) => {
+            "- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
+             - Never pretend you are waiting for a human approval click or confirmation when the runtime policy already permits the action.\n\
+             - If the runtime policy blocks an action, say that directly instead of simulating an approval flow.\n"
+        }
+        Some(crate::security::AutonomyLevel::ReadOnly) => {
+            "- This runtime may reject write-side effects; if that happens, explain the policy restriction directly instead of simulating an approval flow.\n"
+        }
+        _ => {
+            "- Ask for approval only when the runtime policy actually requires it.\n\
+             - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
+        }
+    });
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
     prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
@@ -3344,6 +3496,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
+                .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
         }
@@ -3443,6 +3596,7 @@ fn collect_configured_channels(
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
+                .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
@@ -3707,11 +3861,14 @@ fn collect_configured_channels(
     if let Some(ref qq) = config.channels_config.qq {
         channels.push(ConfiguredChannel {
             display_name: "QQ",
-            channel: Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
@@ -4133,16 +4290,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         None
     };
     let native_tools = provider.supports_native_tools();
-    let mut system_prompt = build_system_prompt_with_mode(
+    let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
         &workspace,
         &model,
         &tool_descs,
         &skills,
         Some(&config.identity),
         bootstrap_max_chars,
+        Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
-        config.autonomy.level,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(
@@ -4260,6 +4417,21 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .slack
         .as_ref()
         .is_some_and(|sl| sl.interrupt_on_new_message);
+    let interrupt_on_new_message_discord = config
+        .channels_config
+        .discord
+        .as_ref()
+        .is_some_and(|dc| dc.interrupt_on_new_message);
+    let interrupt_on_new_message_mattermost = config
+        .channels_config
+        .mattermost
+        .as_ref()
+        .is_some_and(|mm| mm.interrupt_on_new_message);
+    let interrupt_on_new_message_matrix = config
+        .channels_config
+        .matrix
+        .as_ref()
+        .is_some_and(|mx| mx.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -4288,6 +4460,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         interrupt_on_new_message: InterruptOnNewMessageConfig {
             telegram: interrupt_on_new_message,
             slack: interrupt_on_new_message_slack,
+            discord: interrupt_on_new_message_discord,
+            mattermost: interrupt_on_new_message_mattermost,
+            matrix: interrupt_on_new_message_matrix,
         },
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
@@ -4604,6 +4779,9 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4716,6 +4894,9 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4784,6 +4965,9 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4871,6 +5055,9 @@ mod tests {
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5412,6 +5599,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5439,6 +5629,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5488,6 +5679,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5515,6 +5709,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5530,7 +5725,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("telegram_alice")
+            .get("telegram_chat-telegram_alice")
             .expect("telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -5578,6 +5773,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5605,6 +5803,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5653,6 +5852,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5680,6 +5882,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5738,6 +5941,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5765,6 +5971,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5774,7 +5981,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_alice";
+        let route_key = "telegram_chat-1_alice";
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -5806,7 +6013,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), routed_provider);
 
-        let route_key = "telegram_alice".to_string();
+        let route_key = "telegram_chat-1_alice".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
             route_key,
@@ -5844,6 +6051,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5871,6 +6081,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -5931,6 +6142,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5958,6 +6172,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6033,6 +6248,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6060,6 +6278,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6120,6 +6339,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6147,6 +6369,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6197,6 +6420,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6224,6 +6450,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6385,6 +6612,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6411,6 +6641,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         })
         .await
         .unwrap();
@@ -6422,6 +6653,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            interruption_scope_id: None,
         })
         .await
         .unwrap();
@@ -6481,6 +6713,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6508,6 +6743,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6520,6 +6756,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6592,6 +6829,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: true,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -6619,6 +6859,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
+                interruption_scope_id: Some("1741234567.100001".to_string()),
             })
             .await
             .unwrap();
@@ -6631,6 +6872,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
+                interruption_scope_id: Some("1741234567.100001".to_string()),
             })
             .await
             .unwrap();
@@ -6700,6 +6942,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6727,6 +6972,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6739,6 +6985,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             })
             .await
             .unwrap();
@@ -6790,6 +7037,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6817,6 +7067,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6865,6 +7116,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6892,6 +7146,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -6976,7 +7231,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
 
         assert!(prompt.contains("Do not exfiltrate private data"));
-        assert!(prompt.contains("Do not run destructive commands"));
+        assert!(prompt.contains("Respect the runtime autonomy policy"));
         assert!(prompt.contains("Prefer `trash` over `rm`"));
     }
 
@@ -7108,7 +7363,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_compact_mode_omits_instructions_and_tools() {
+    fn prompt_skills_compact_mode_omits_instructions_but_keeps_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -7146,7 +7401,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(!prompt.contains("<tools>"));
+        // Compact mode should still include tools so the LLM knows about them
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<name>lint</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
     }
 
     #[test]
@@ -7248,6 +7506,64 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
             "missing security instruction"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_prompt_executes_allowed_tools_without_extra_approval() {
+        let ws = make_workspace();
+        let config = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "model",
+            &[],
+            &[],
+            None,
+            None,
+            Some(&config),
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(
+            prompt.contains("execute it directly instead of asking the user for extra approval"),
+            "full autonomy should instruct direct execution for allowed tools"
+        );
+        assert!(
+            prompt.contains("Never pretend you are waiting for a human approval"),
+            "full autonomy should not simulate interactive approval flows"
+        );
+    }
+
+    #[test]
+    fn readonly_prompt_explains_policy_blocks_without_fake_approval() {
+        let ws = make_workspace();
+        let config = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::ReadOnly,
+            ..crate::config::AutonomyConfig::default()
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "model",
+            &[],
+            &[],
+            None,
+            None,
+            Some(&config),
+            false,
+            crate::config::SkillsPromptInjectionMode::Full,
+        );
+
+        assert!(
+            prompt.contains("this runtime is read-only for side effects"),
+            "read-only prompt should expose the runtime restriction"
+        );
+        assert!(
+            prompt.contains("instead of simulating an approval flow"),
+            "read-only prompt should explain restrictions instead of faking approval"
         );
     }
 
@@ -7355,6 +7671,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -7370,6 +7687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
+            interruption_scope_id: None,
         };
 
         assert_eq!(
@@ -7388,6 +7706,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "cli".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -7403,6 +7722,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -7412,6 +7732,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         assert_ne!(
@@ -7433,6 +7754,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -7442,6 +7764,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         mem.store(
@@ -7558,6 +7881,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7585,6 +7911,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7600,6 +7927,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7642,6 +7970,7 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             false,
             config.skills.prompt_injection_mode,
+            AutonomyLevel::default(),
         );
         assert!(
             !initial_system_prompt.contains("refresh-test"),
@@ -7682,10 +8011,14 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
             query_classification: crate::config::QueryClassificationConfig::default(),
@@ -7708,6 +8041,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7739,6 +8073,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7750,7 +8085,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                !histories.contains_key("telegram_alice"),
+                !histories.contains_key("telegram_chat-refresh_alice"),
                 "/new should clear the cached sender history before the next message"
             );
         }
@@ -7761,7 +8096,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                pending_new_sessions.contains("telegram_alice"),
+                pending_new_sessions.contains("telegram_chat-refresh_alice"),
                 "/new should mark the sender for a fresh next-message prompt rebuild"
             );
         }
@@ -7776,6 +8111,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7845,6 +8181,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7872,6 +8211,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -7893,7 +8233,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_alice")
+            .get("test-channel_chat-ctx_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -7911,7 +8251,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let mut histories = HashMap::new();
         histories.insert(
-            "telegram_alice".to_string(),
+            "telegram_chat-telegram_alice".to_string(),
             vec![
                 ChatMessage::assistant("stale assistant"),
                 ChatMessage::user("earlier user question"),
@@ -7946,6 +8286,9 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7973,6 +8316,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8276,6 +8620,7 @@ This is an example JSON object for profile settings."#;
             allowed_users: vec![],
             thread_replies: Some(true),
             mention_only: Some(false),
+            interrupt_on_new_message: false,
         });
 
         let channels = collect_configured_channels(&config, "test");
@@ -8511,6 +8856,9 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8539,6 +8887,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8593,6 +8942,9 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8620,6 +8972,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8635,6 +8988,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8659,7 +9013,7 @@ This is an example JSON object for profile settings."#;
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_zeroclaw_user")
+            .get("test-channel_chat-photo_zeroclaw_user")
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -8749,6 +9103,9 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8776,6 +9133,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8855,6 +9213,9 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8882,6 +9243,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -8953,6 +9315,9 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8980,6 +9345,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -9071,6 +9437,9 @@ This is an example JSON object for profile settings."#;
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
                 slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9098,6 +9467,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                interruption_scope_id: None,
             },
             CancellationToken::new(),
         )
@@ -9148,5 +9518,244 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    // ── is_stop_command tests ─────────────────────────────────────────────
+
+    #[test]
+    fn is_stop_command_matches_bare_slash_stop() {
+        assert!(is_stop_command("/stop"));
+    }
+
+    #[test]
+    fn is_stop_command_matches_with_leading_trailing_whitespace() {
+        assert!(is_stop_command("  /stop  "));
+    }
+
+    #[test]
+    fn is_stop_command_is_case_insensitive() {
+        assert!(is_stop_command("/STOP"));
+        assert!(is_stop_command("/Stop"));
+    }
+
+    #[test]
+    fn is_stop_command_matches_with_bot_suffix() {
+        assert!(is_stop_command("/stop@zeroclaw_bot"));
+    }
+
+    #[test]
+    fn is_stop_command_rejects_other_slash_commands() {
+        assert!(!is_stop_command("/new"));
+        assert!(!is_stop_command("/model gpt-4"));
+        assert!(!is_stop_command("/models"));
+    }
+
+    #[test]
+    fn is_stop_command_rejects_plain_text() {
+        assert!(!is_stop_command("stop"));
+        assert!(!is_stop_command("please stop"));
+        assert!(!is_stop_command(""));
+    }
+
+    #[test]
+    fn is_stop_command_rejects_stop_as_substring() {
+        assert!(!is_stop_command("/stopwatch"));
+        assert!(!is_stop_command("/stop-all"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_enabled_for_mattermost_when_true() {
+        let cfg = InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: true,
+            matrix: false,
+        };
+        assert!(cfg.enabled_for_channel("mattermost"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_disabled_for_mattermost_by_default() {
+        let cfg = InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+        };
+        assert!(!cfg.enabled_for_channel("mattermost"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_enabled_for_discord() {
+        let cfg = InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: true,
+            mattermost: false,
+            matrix: false,
+        };
+        assert!(cfg.enabled_for_channel("discord"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_disabled_for_discord_by_default() {
+        let cfg = InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+        };
+        assert!(!cfg.enabled_for_channel("discord"));
+    }
+
+    // ── interruption_scope_key tests ──────────────────────────────────────
+
+    #[test]
+    fn interruption_scope_key_without_scope_id_is_three_component() {
+        let msg = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "room".into(),
+            content: "hi".into(),
+            channel: "matrix".into(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+        };
+        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
+    }
+
+    #[test]
+    fn interruption_scope_key_with_scope_id_is_four_component() {
+        let msg = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "room".into(),
+            content: "hi".into(),
+            channel: "matrix".into(),
+            timestamp: 0,
+            thread_ts: Some("$thread1".into()),
+            interruption_scope_id: Some("$thread1".into()),
+        };
+        assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
+    }
+
+    #[test]
+    fn interruption_scope_key_thread_ts_alone_does_not_affect_key() {
+        // thread_ts used for reply anchoring should not bleed into scope key
+        let msg = traits::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "hi".into(),
+            channel: "slack".into(),
+            timestamp: 0,
+            thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
+            interruption_scope_id: None,                 // but NOT a thread reply
+        };
+        assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_different_threads_do_not_cancel_each_other() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(150),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: true,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
+        let send_task = tokio::spawn(async move {
+            // Two messages from same sender but in different Slack threads —
+            // they must NOT cancel each other.
+            tx.send(traits::ChannelMessage {
+                id: "1741234567.100001".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "C123".to_string(),
+                content: "thread-a question".to_string(),
+                channel: "slack".to_string(),
+                timestamp: 1,
+                thread_ts: Some("1741234567.100001".to_string()),
+                interruption_scope_id: Some("1741234567.100001".to_string()),
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send(traits::ChannelMessage {
+                id: "1741234567.200002".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "C123".to_string(),
+                content: "thread-b question".to_string(),
+                channel: "slack".to_string(),
+                timestamp: 2,
+                thread_ts: Some("1741234567.200002".to_string()),
+                interruption_scope_id: Some("1741234567.200002".to_string()),
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        send_task.await.unwrap();
+
+        // Both tasks should have completed — different threads, no cancellation.
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            2,
+            "both Slack thread messages should complete, got: {sent_messages:?}"
+        );
     }
 }
