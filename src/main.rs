@@ -1872,6 +1872,70 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     }
 }
 
+fn auth_profile_kind_tag(kind: auth::profiles::AuthProfileKind) -> &'static str {
+    match kind {
+        auth::profiles::AuthProfileKind::OAuth => "oauth",
+        auth::profiles::AuthProfileKind::Token => "api",
+    }
+}
+
+fn render_auth_list_lines(data: &auth::profiles::AuthProfilesData) -> Vec<String> {
+    data.profiles
+        .iter()
+        .map(|(id, profile)| {
+            let active = data
+                .active_profiles
+                .get(&profile.provider)
+                .is_some_and(|active_id| active_id == id);
+            let marker = if active { "*" } else { " " };
+            let kind_tag = auth_profile_kind_tag(profile.kind);
+            format!("{marker} [{kind_tag}] {id}")
+        })
+        .collect()
+}
+
+fn render_auth_status_lines(data: &auth::profiles::AuthProfilesData) -> Vec<String> {
+    let mut lines: Vec<String> = data
+        .profiles
+        .iter()
+        .map(|(id, profile)| {
+            let active = data
+                .active_profiles
+                .get(&profile.provider)
+                .is_some_and(|active_id| active_id == id);
+            let marker = if active { "*" } else { " " };
+            let kind_tag = auth_profile_kind_tag(profile.kind);
+            format!(
+                "{} [{}] {} account={} expires={}",
+                marker,
+                kind_tag,
+                id,
+                crate::security::redact(profile.account_id.as_deref().unwrap_or("unknown")),
+                format_expiry(profile)
+            )
+        })
+        .collect();
+
+    lines.push(String::new());
+    lines.push("Active profiles:".to_string());
+    for (provider, profile_id) in &data.active_profiles {
+        lines.push(format!("  {provider}: {profile_id}"));
+    }
+    lines
+}
+
+fn print_auth_list(data: &auth::profiles::AuthProfilesData) {
+    for line in render_auth_list_lines(data) {
+        println!("{line}");
+    }
+}
+
+fn print_auth_status(data: &auth::profiles::AuthProfilesData) {
+    for line in render_auth_status_lines(data) {
+        println!("{line}");
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
@@ -2288,14 +2352,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 return Ok(());
             }
 
-            for (id, profile) in &data.profiles {
-                let active = data
-                    .active_profiles
-                    .get(&profile.provider)
-                    .is_some_and(|active_id| active_id == id);
-                let marker = if active { "*" } else { " " };
-                println!("{marker} {id}");
-            }
+            print_auth_list(&data);
 
             Ok(())
         }
@@ -2307,27 +2364,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 return Ok(());
             }
 
-            for (id, profile) in &data.profiles {
-                let active = data
-                    .active_profiles
-                    .get(&profile.provider)
-                    .is_some_and(|active_id| active_id == id);
-                let marker = if active { "*" } else { " " };
-                println!(
-                    "{} {} kind={:?} account={} expires={}",
-                    marker,
-                    id,
-                    profile.kind,
-                    crate::security::redact(profile.account_id.as_deref().unwrap_or("unknown")),
-                    format_expiry(profile)
-                );
-            }
-
-            println!();
-            println!("Active profiles:");
-            for (provider, profile_id) in &data.active_profiles {
-                println!("  {provider}: {profile_id}");
-            }
+            print_auth_status(&data);
 
             Ok(())
         }
@@ -2374,14 +2411,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     return Ok(());
                 }
 
-                for (id, profile) in &data.profiles {
-                    let active = data
-                        .active_profiles
-                        .get(&profile.provider)
-                        .is_some_and(|active_id| active_id == id);
-                    let marker = if active { "*" } else { " " };
-                    println!("{marker} {id}");
-                }
+                print_auth_list(&data);
 
                 Ok(())
             }
@@ -2392,27 +2422,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     return Ok(());
                 }
 
-                for (id, profile) in &data.profiles {
-                    let active = data
-                        .active_profiles
-                        .get(&profile.provider)
-                        .is_some_and(|active_id| active_id == id);
-                    let marker = if active { "*" } else { " " };
-                    println!(
-                        "{} {} kind={:?} account={} expires={}",
-                        marker,
-                        id,
-                        profile.kind,
-                        crate::security::redact(profile.account_id.as_deref().unwrap_or("unknown")),
-                        format_expiry(profile)
-                    );
-                }
-
-                println!();
-                println!("Active profiles:");
-                for (provider, profile_id) in &data.active_profiles {
-                    println!("  {provider}: {profile_id}");
-                }
+                print_auth_status(&data);
 
                 Ok(())
             }
@@ -2423,6 +2433,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::profiles::{AuthProfile, AuthProfilesData, TokenSet};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -2555,6 +2566,77 @@ mod tests {
             }
             other => panic!("expected auth api use command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn auth_list_lines_show_profile_kind_tags() {
+        let mut data = AuthProfilesData::default();
+        let mut oauth = AuthProfile::new_oauth(
+            "gemini",
+            "work",
+            TokenSet {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                id_token: None,
+                expires_at: None,
+                token_type: None,
+                scope: None,
+            },
+        );
+        oauth.account_id = Some("user@example.com".to_string());
+        let token = AuthProfile::new_token("openrouter", "default", "sk-or-v1".to_string());
+
+        data.profiles.insert(oauth.id.clone(), oauth.clone());
+        data.profiles.insert(token.id.clone(), token.clone());
+        data.active_profiles
+            .insert("gemini".to_string(), oauth.id.clone());
+        data.active_profiles
+            .insert("openrouter".to_string(), token.id.clone());
+
+        let lines = render_auth_list_lines(&data);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("[oauth] gemini:work")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("[api] openrouter:default")));
+    }
+
+    #[test]
+    fn auth_status_lines_show_profile_kind_tags() {
+        let mut data = AuthProfilesData::default();
+        let oauth = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                id_token: None,
+                expires_at: None,
+                token_type: None,
+                scope: None,
+            },
+        );
+        let token = AuthProfile::new_token("openrouter", "work", "sk-or-v1".to_string());
+
+        data.profiles.insert(oauth.id.clone(), oauth.clone());
+        data.profiles.insert(token.id.clone(), token.clone());
+        data.active_profiles
+            .insert("openai-codex".to_string(), oauth.id.clone());
+        data.active_profiles
+            .insert("openrouter".to_string(), token.id.clone());
+
+        let lines = render_auth_status_lines(&data);
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("[oauth] openai-codex:default")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("[api] openrouter:work")));
+        assert!(lines.iter().any(|line| line == "Active profiles:"));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("openrouter: openrouter:work")));
     }
 
     #[test]
